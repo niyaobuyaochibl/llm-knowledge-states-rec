@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""Run a SASRec backbone robustness audit for the DKE revision.
+
+The script reuses the prepared formal split/config files and emits the same
+core tables as the LightGCN formal runner: method metrics, user-level metrics,
+TOD/RFR, group sensitivity, recommendations, and a markdown report.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+
+ROOT = Path("/root/temporal_popularity_pilot")
+SRC = ROOT / "src"
+sys.path.insert(0, str(SRC))
+
+from temporal_popularity.audit import group_temporal_sensitivity, temporal_overclaim_and_rfr  # noqa: E402
+from temporal_popularity.data import (  # noqa: E402
+    activity_controlled_user_groups,
+    build_exclude_lists,
+    build_user_histories,
+    infer_shape,
+    read_interaction_split,
+    set_seed,
+)
+from temporal_popularity.eval import metric_row, method_specs, rank_scores_for_method, select_lambda, topk_indices  # noqa: E402
+from temporal_popularity.popularity import SECONDS_PER_DAY, assign_buckets, popularity_percentiles, static_popularity  # noqa: E402
+from temporal_popularity.reporting import ensure_dirs, markdown_table  # noqa: E402
+from temporal_popularity.sequential import (  # noqa: E402
+    SASRec,
+    build_ordered_user_sequences,
+    sequence_rows_for_users,
+    train_sasrec,
+)
+from temporal_popularity.snapshots import user_snapshot_map  # noqa: E402
+from temporal_popularity.temporal import build_temporal_snapshot_features  # noqa: E402
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config", type=Path)
+    parser.add_argument("--outdir", type=Path, default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--max-len", type=int, default=50)
+    parser.add_argument("--embedding-dim", type=int, default=64)
+    parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--heads", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--samples-per-epoch", type=int, default=200000)
+    parser.add_argument("--train-batch-size", type=int, default=512)
+    parser.add_argument("--eval-batch-size", type=int, default=128)
+    parser.add_argument("--learning-rate", type=float, default=0.001)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument(
+        "--base-only",
+        action="store_true",
+        help="Evaluate only the SASRec Base list. Useful for large-dataset backbone checks.",
+    )
+    return parser.parse_args()
+
+
+def device_from_arg(arg: str) -> torch.device:
+    if arg == "cpu":
+        return torch.device("cpu")
+    if arg == "cuda":
+        return torch.device("cuda")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def default_outdir(config: Mapping[str, object]) -> Path:
+    dataset_dir = "yelp" if config["dataset"] == "yelp_original_reviews" else str(config["dataset"])
+    return ROOT / "results/formal/backbone_robustness" / dataset_dir / f"seed{int(config['seed'])}" / "sasrec"
+
+
+def update_manifest(run_dir: Path, updates: Mapping[str, object]) -> None:
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = {}
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(updates)
+    manifest["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def build_eval_temporal(
+    eval_frame: pd.DataFrame,
+    all_events: pd.DataFrame,
+    n_users: int,
+    n_items: int,
+    static_pop: np.ndarray,
+    config: Mapping[str, object],
+) -> Tuple[Dict[str, np.ndarray], np.ndarray, pd.DataFrame]:
+    evaluation = config["evaluation"]
+    popularity = config["popularity"]
+    window_seconds = int(popularity["main_recent_window_days"]) * SECONDS_PER_DAY
+    tau_seconds = int(popularity["main_decay_tau_days"]) * SECONDS_PER_DAY
+    protocol = evaluation["temporal_protocol"]
+
+    if protocol == "exact_per_user_timestamp":
+        ordered = eval_frame.sort_values("uid", kind="mergesort").reset_index(drop=True)
+        snapshot_times = ordered["timestamp"].to_numpy(np.int64)
+        weights = np.ones(len(snapshot_times), dtype=np.int64)
+        user_snapshot = np.zeros(n_users, dtype=np.int32)
+        user_snapshot[ordered["uid"].to_numpy(np.int64)] = np.arange(len(ordered), dtype=np.int32)
+    elif protocol == "weighted_test_time_snapshots":
+        snapshot_times, weights, user_snapshot = user_snapshot_map(
+            eval_frame, n_users, int(evaluation["snapshot_count"])
+        )
+    else:
+        raise ValueError(f"Unsupported temporal protocol: {protocol}")
+
+    temporal = build_temporal_snapshot_features(
+        all_events,
+        snapshot_times,
+        n_items,
+        static_pop,
+        window_seconds,
+        tau_seconds,
+    )
+    return temporal, user_snapshot, pd.DataFrame({"timestamp": snapshot_times, "weight": weights})
+
+
+def evaluate_sasrec_methods(
+    model: SASRec,
+    sequences: Sequence[np.ndarray],
+    eval_frame: pd.DataFrame,
+    train_histories: Sequence[np.ndarray],
+    exclude_lists: Sequence[np.ndarray],
+    static_pop: np.ndarray,
+    static_bucket: np.ndarray,
+    static_pct: np.ndarray,
+    temporal: Mapping[str, np.ndarray],
+    user_snapshot: np.ndarray,
+    groups: Mapping[int, str],
+    specs: Mapping[str, Tuple[str, Optional[float]]],
+    topk: int,
+    batch_size: int,
+    device: torch.device,
+    collect_user_level: bool,
+) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], Dict[str, np.ndarray]]:
+    eval_sorted = eval_frame.sort_values("uid", kind="mergesort").reset_index(drop=True)
+    eval_users = eval_sorted["uid"].to_numpy(np.int64)
+    targets = eval_sorted["iid"].to_numpy(np.int64)
+    n_items = len(static_pop)
+    method_names = list(specs.keys())
+    metric_sums: Dict[str, Dict[str, float]] = {name: {} for name in method_names}
+    metric_counts: Dict[str, int] = {name: 0 for name in method_names}
+    user_rows: List[Dict[str, object]] = []
+    recs: Dict[str, np.ndarray] = {}
+    if collect_user_level:
+        recs = {name: np.zeros((len(eval_users), topk), dtype=np.int64) for name in method_names}
+
+    static_hist_median = np.asarray(
+        [
+            float(np.median(static_pct[train_histories[int(uid)]])) if len(train_histories[int(uid)]) else 0.0
+            for uid in range(len(train_histories))
+        ],
+        dtype=np.float32,
+    )
+
+    model.eval()
+    for start in range(0, len(eval_users), batch_size):
+        end = min(start + batch_size, len(eval_users))
+        batch_users = eval_users[start:end]
+        seq_rows = sequence_rows_for_users(sequences, batch_users, model.max_len)
+        seq_t = torch.as_tensor(seq_rows, dtype=torch.long, device=device)
+        with torch.no_grad():
+            score_batch = model.score_all(seq_t).detach().cpu().numpy().astype(np.float32)
+
+        for local_row, uid_np in enumerate(batch_users):
+            uid = int(uid_np)
+            global_row = start + local_row
+            excluded = exclude_lists[uid]
+            candidate_mask = np.ones(n_items, dtype=bool)
+            candidate_mask[excluded] = False
+            candidate_items = np.flatnonzero(candidate_mask)
+            candidate_scores = score_batch[local_row, candidate_items]
+            snap = int(user_snapshot[uid])
+            hist = train_histories[uid]
+            target = int(targets[global_row])
+            decay_pct = temporal["decay_pct"][snap]
+            temporal_decay_hist_median = float(np.median(decay_pct[hist])) if len(hist) else 0.0
+
+            for method, (kind, lam) in specs.items():
+                rank_scores = rank_scores_for_method(
+                    kind,
+                    lam,
+                    candidate_scores,
+                    candidate_items,
+                    static_pop,
+                    temporal["decay_pop"][snap],
+                    static_pct=static_pct,
+                    temporal_decay_pct=decay_pct,
+                    static_target=float(static_hist_median[uid]),
+                    temporal_target=temporal_decay_hist_median,
+                )
+                rec = candidate_items[topk_indices(rank_scores, topk)]
+                if collect_user_level:
+                    recs[method][global_row] = rec
+                row = metric_row(
+                    method,
+                    uid,
+                    groups[uid],
+                    rec,
+                    target,
+                    hist,
+                    snap,
+                    static_pop,
+                    static_bucket,
+                    static_pct,
+                    temporal,
+                    static_hist_median,
+                )
+                if collect_user_level:
+                    user_rows.append(row)
+                for key, value in row.items():
+                    if key in {"Method", "uid", "Group"}:
+                        continue
+                    metric_sums[method][key] = metric_sums[method].get(key, 0.0) + float(value)
+                metric_counts[method] += 1
+        if end == len(eval_users) or end % (batch_size * 50) == 0:
+            print(f"sasrec evaluated users={end}/{len(eval_users)} methods={len(method_names)}", flush=True)
+
+    summary_rows: List[Dict[str, object]] = []
+    for method in method_names:
+        count = metric_counts[method]
+        row = {"Method": method, "Users": count}
+        for key, total in metric_sums[method].items():
+            row[key] = total / count
+        summary_rows.append(row)
+    return pd.DataFrame(summary_rows), pd.DataFrame(user_rows) if collect_user_level else None, recs
+
+
+def write_report(run_dir: Path, test_summary: pd.DataFrame, tod: pd.DataFrame, group_df: pd.DataFrame) -> None:
+    lines = [
+        "# SASRec Backbone Robustness Report",
+        "",
+        "This DKE robustness run evaluates the same temporal-popularity audit protocol with a sequential SASRec backbone.",
+        "",
+        "## Test Method Metrics",
+        "",
+        markdown_table(test_summary),
+        "",
+        "## Temporal Overclaim / Ranking Flip",
+        "",
+        markdown_table(tod),
+        "",
+        "## Group Temporal Sensitivity",
+        "",
+        markdown_table(group_df),
+    ]
+    (run_dir / "sasrec_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main() -> None:
+    args = parse_args()
+    config = json.loads(args.config.read_text(encoding="utf-8"))
+    run_dir = args.outdir or default_outdir(config)
+    ensure_dirs(run_dir)
+    if (run_dir / "completed.ok").exists() and not args.force and not args.dry_run:
+        raise SystemExit(f"Run already completed: {run_dir}")
+
+    seed = int(config["seed"])
+    set_seed(seed)
+    datadir = Path(config["prepared_data"]["datadir"])
+    train, val, test, all_events = read_interaction_split(datadir)
+    n_users, n_items = infer_shape(train, val, test)
+    static_pop = static_popularity(train, n_items)
+    static_bucket = assign_buckets(static_pop, static_pop, dormant_for_zero=False)
+    static_pct = popularity_percentiles(static_pop, static_pop)
+    train_histories = build_user_histories(train, n_users)
+    train_sequences = build_ordered_user_sequences(train, n_users)
+    test_sequence_frame = pd.concat([train, val], ignore_index=True)
+    test_sequences = build_ordered_user_sequences(test_sequence_frame, n_users)
+    groups = activity_controlled_user_groups(train_histories, static_pct)
+    topk = int(config["evaluation"]["topk"])
+
+    split_stats = pd.DataFrame(
+        [
+            {
+                "dataset": config["dataset"],
+                "seed": seed,
+                "backbone": "SASRec",
+                "users": n_users,
+                "items": n_items,
+                "train": len(train),
+                "val": len(val),
+                "test": len(test),
+                "all_events": len(all_events),
+                "temporal_protocol": config["evaluation"]["temporal_protocol"],
+                "max_len": args.max_len,
+                "embedding_dim": args.embedding_dim,
+                "layers": args.layers,
+                "heads": args.heads,
+            }
+        ]
+    )
+    split_stats.to_csv(run_dir / "split_stats.csv", index=False)
+    update_manifest(
+        run_dir,
+        {
+            "status": "dry_run_ok" if args.dry_run else "running",
+            "dataset": config["dataset"],
+            "seed": seed,
+            "backbone": "SASRec",
+            "config": str(args.config),
+        },
+    )
+    if args.dry_run:
+        print(f"Dry run OK: {run_dir}", flush=True)
+        return
+
+    device = device_from_arg(args.device)
+    model = SASRec(
+        n_items=n_items,
+        max_len=args.max_len,
+        embedding_dim=args.embedding_dim,
+        layers=args.layers,
+        heads=args.heads,
+        dropout=args.dropout,
+    ).to(device)
+    model = train_sasrec(
+        model,
+        train_sequences,
+        n_items,
+        seed,
+        args.epochs,
+        args.samples_per_epoch,
+        args.train_batch_size,
+        args.learning_rate,
+        args.weight_decay,
+        device,
+    )
+    torch.save(model.state_dict(), run_dir / "sasrec.pt")
+
+    static_lambda = None
+    temporal_lambda = None
+    if not args.base_only:
+        print("Building SASRec validation temporal states...", flush=True)
+        val_temporal, val_user_snapshot, val_snapshot_table = build_eval_temporal(
+            val, all_events, n_users, n_items, static_pop, config
+        )
+        val_snapshot_table.to_csv(run_dir / "validation_snapshot_times.csv", index=False)
+        val_specs = method_specs(config["lambda_grid"])
+        val_summary, _, _ = evaluate_sasrec_methods(
+            model,
+            train_sequences,
+            val,
+            train_histories,
+            build_exclude_lists(train_histories, None, n_users),
+            static_pop,
+            static_bucket,
+            static_pct,
+            val_temporal,
+            val_user_snapshot,
+            groups,
+            val_specs,
+            topk,
+            args.eval_batch_size,
+            device,
+            collect_user_level=False,
+        )
+        val_summary.to_csv(run_dir / "validation_all_lambda_metrics.csv", index=False)
+        static_lambda, static_lambda_table = select_lambda(
+            val_summary,
+            "Base",
+            "StaticPopPenalty@",
+            config["selection_rule"]["static_method_metric"],
+        )
+        temporal_lambda, temporal_lambda_table = select_lambda(
+            val_summary,
+            "Base",
+            "TemporalPopPenalty@",
+            config["selection_rule"]["temporal_method_metric"],
+        )
+        static_lambda_table.to_csv(run_dir / "validation_static_lambda_table.csv", index=False)
+        temporal_lambda_table.to_csv(run_dir / "validation_temporal_lambda_table.csv", index=False)
+
+    print("Building SASRec test temporal states...", flush=True)
+    test_temporal, test_user_snapshot, test_snapshot_table = build_eval_temporal(
+        test, all_events, n_users, n_items, static_pop, config
+    )
+    test_snapshot_table.to_csv(run_dir / "test_snapshot_times.csv", index=False)
+    if args.base_only:
+        selected_specs = {"Base": ("base", None)}
+    else:
+        selected_specs = {
+            "Base": ("base", None),
+            f"StaticPopPenalty@{static_lambda:g}": ("static", static_lambda),
+            f"TemporalPopPenalty@{temporal_lambda:g}": ("temporal", temporal_lambda),
+        }
+    test_summary, user_level, recs = evaluate_sasrec_methods(
+        model,
+        test_sequences,
+        test,
+        train_histories,
+        build_exclude_lists(train_histories, val, n_users),
+        static_pop,
+        static_bucket,
+        static_pct,
+        test_temporal,
+        test_user_snapshot,
+        groups,
+        selected_specs,
+        topk,
+        args.eval_batch_size,
+        device,
+        collect_user_level=True,
+    )
+    method_names = list(selected_specs.keys())
+    tod = temporal_overclaim_and_rfr(test_summary, method_names, temporal_definition="Decay")
+    group_df = group_temporal_sensitivity(user_level, method_names)
+    test_summary.to_csv(run_dir / "test_method_metrics.csv", index=False)
+    user_level.to_csv(run_dir / "test_user_level_metrics.csv", index=False)
+    tod.to_csv(run_dir / "tod_rfr.csv", index=False)
+    group_df.to_csv(run_dir / "group_sensitivity.csv", index=False)
+    for method, matrix in recs.items():
+        np.save(run_dir / f"recs_{method.replace('@', '_').replace('.', 'p')}.npy", matrix)
+    write_report(run_dir, test_summary, tod, group_df)
+
+    (run_dir / "completed.ok").write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
+    update_manifest(
+        run_dir,
+        {
+            "status": "completed",
+            "selected_static_lambda": static_lambda,
+            "selected_temporal_lambda": temporal_lambda,
+            "base_only": bool(args.base_only),
+            "report": str(run_dir / "sasrec_report.md"),
+        },
+    )
+    print(f"Done. Report: {run_dir / 'sasrec_report.md'}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

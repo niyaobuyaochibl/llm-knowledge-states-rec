@@ -1,0 +1,52 @@
+{
+  "dataset": "yelp_original_reviews",
+  "seeds": [42, 43, 44],
+  "split": {
+    "k_core": 10,
+    "leave_one_out": true,
+    "test": "last_interaction",
+    "validation": "second_last_interaction",
+    "drop_eval_items_not_in_train": true,
+    "source": "raw yelp_academic_dataset_review.json"
+  },
+  "backbone": {
+    "name": "LightGCN",
+    "embedding_dim": 64,
+    "layers": 3,
+    "epochs": 80,
+    "samples_per_epoch": 400000,
+    "learning_rate": 0.001,
+    "reg": 0.0001
+  },
+  "evaluation": {
+    "topk": 20,
+    "full_ranking": true,
+    "exclude_train_and_validation": true,
+    "temporal_protocol": "weighted_test_time_snapshots",
+    "snapshot_count": 200,
+    "snapshot_validation": "5000_user_time_stratified_exact_subset"
+  },
+  "popularity": {
+    "main_recent_window_days": 180,
+    "main_decay_tau_days": 180,
+    "robustness_days": [90, 365],
+    "definitions": ["StaticTrainPop", "RecentPop", "DecayPop", "CumulativePop"]
+  },
+  "methods": {
+    "pilot_ready": ["Base", "StaticPopPenalty", "TemporalPopPenalty"],
+    "formal_to_add": ["StaticPopCal", "TemporalPopCal", "ExistingDebiasingBaseline"]
+  },
+  "lambda_grid": [0.01, 0.03, 0.1, 0.3, 1.0],
+  "selection_rule": {
+    "accuracy_metric": "NDCG@20",
+    "max_ndcg_drop": 0.05,
+    "static_method_metric": "Static_LTR@20",
+    "temporal_method_metric": "Decay_LTR@20"
+  },
+  "protocol_robustness": {
+    "snapshot_counts_checked": [50, 100, 200, 400],
+    "windows_checked": [90, 180, 365],
+    "exact_subset_users": 5000,
+    "exact_subset_max_bdr_error": 0.000054
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "status": "completed",
+  "candidate_run_dir": "/root/temporal_popularity_pilot/results/egpr_profile_repair/amazon_books_seed42_lightgcn_1000",
+  "profile_run_dir": "/root/temporal_popularity_pilot/results/egpr_profile_repair/amazon_books_seed42_deepseek_1000_expressive5",
+  "direct_top50_dir": "/root/temporal_popularity_pilot/results/egpr_profile_repair/amazon_books_direct_vs_profile/direct_rerank_1000_top50",
+  "direct_top100_dir": "/root/temporal_popularity_pilot/results/egpr_profile_repair/amazon_books_direct_vs_profile/direct_rerank_1000_top100",
+  "candidate_sizes": [
+    50,
+    100
+  ],
+  "users": 1000,
+  "bootstrap_samples": 10000,
+  "permutation_samples": 100000,
+  "profile_generation_cost_usd": 0.16805068,
+  "updated_at_utc": "2026-05-21T02:57:14.207708+00:00"
+}

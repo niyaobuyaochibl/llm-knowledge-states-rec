@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+title: >-
+  ALIS: Adaptive Knowledge-Interface Selection for LLM-Assisted Recommender Systems
+message: >-
+  If you use this software or the released artefacts, please cite this repository
+  and the accompanying paper when available.
+type: software
+authors:
+  - given-names: Yunan
+    family-names: Zhang
+    affiliation: Hebei University of Architecture
+    email: zyn2024229134@hebiace.edu.cn
+  - given-names: Jingjing
+    family-names: Fan
+    affiliation: Hebei University of Architecture
+    email: fjj1960@hebiace.edu.cn
+  - given-names: Yanxiao
+    family-names: Liu
+    affiliation: Hebei University of Architecture
+    email: lyx2025229119@hebiace.edu.cn
+preferred-citation:
+  type: generic
+  title: >-
+    ALIS: Adaptive Knowledge-Interface Selection for LLM-Assisted Recommender Systems
+  authors:
+    - given-names: Yunan
+      family-names: Zhang
+    - given-names: Jingjing
+      family-names: Fan
+    - given-names: Yanxiao
+      family-names: Liu
+  year: 2026
+license: MIT
+repository-code: https://github.com/niyaobuyaochibl/llm-knowledge-states-rec

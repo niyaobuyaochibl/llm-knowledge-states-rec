@@ -1,0 +1,16 @@
+{
+  "status": "completed",
+  "profile_run_dir": "/root/temporal_popularity_pilot/results/egpr_profile_repair/yelp_seed42_deepseek_1000_expressive5",
+  "direct_top50_dir": "/root/temporal_popularity_pilot/results/egpr_profile_repair/yelp_direct_vs_profile/direct_rerank_1000_top50",
+  "direct_top100_dir": "/root/temporal_popularity_pilot/results/egpr_profile_repair/yelp_direct_vs_profile/direct_rerank_1000_top100",
+  "profile_candidate_dir": "/root/temporal_popularity_pilot/results/egpr_profile_repair/yelp_direct_vs_profile/profile_candidate_sizes_1000",
+  "candidate_sizes": [
+    50,
+    100
+  ],
+  "users": 1000,
+  "bootstrap_samples": 10000,
+  "permutation_samples": 100000,
+  "profile_generation_cost_usd": 0.28640234,
+  "updated_at_utc": "2026-05-20T13:22:28.661079+00:00"
+}

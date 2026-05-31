@@ -1,0 +1,13 @@
+{
+  "dataset": "ML-1M",
+  "users": 2000,
+  "candidate_setting": "direct LightGCN top-50 candidates reused for direct and profile reranking",
+  "same_test_users": true,
+  "same_targets": true,
+  "direct_ndcg": 0.03119607385806312,
+  "profile_raw_ndcg": 0.02780546785623266,
+  "profile_egpr_ndcg": 0.02798493013171209,
+  "profile_egpr_beats_direct": false,
+  "profile_test_cost_below_direct": true,
+  "updated_at_utc": "2026-05-20T06:38:51.340177+00:00"
+}

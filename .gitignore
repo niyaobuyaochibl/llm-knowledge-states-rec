@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Build / cache
+*.log
+.cache/
+.pytest_cache/
+
+# Large or sensitive artefacts that should not be redistributed
+data/
+checkpoints/
+*.pt
+*.ckpt
+*.npy
+*.npz
+
+# API keys
+.env.local
+*.key
